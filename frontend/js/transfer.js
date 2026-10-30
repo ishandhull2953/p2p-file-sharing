@@ -9,7 +9,11 @@ const FALLBACK_ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
 ];
-const CHUNK_SIZE = 16 * 1024; // 16KB — safe, conventional WebRTC data channel chunk size
+// Keep small transfers cheap, but avoid creating thousands of 16 KB pieces for
+// larger files.  64 KB is deliberately capped to remain data-channel friendly.
+const MIN_CHUNK_SIZE = 16 * 1024;
+const MAX_CHUNK_SIZE = 64 * 1024;
+const TARGET_CHUNKS_PER_FILE = 128;
 const CHUNK_PACING_MS = 20;   // small delay between chunk sends (lets the UI animate)
 const MAX_BUFFERED_AMOUNT = 256 * 1024; // don't queue more than this much unsent data on a channel
 const BUFFER_DRAIN_TIMEOUT_MS = 8000;
@@ -25,6 +29,18 @@ const MAX_RETRANSMIT_ROUNDS = 5;
 const MAX_BATCH_CHUNKS = 32;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/**
+ * Pick a chunk size from the file size. Sizes are rounded to KiB so transfer
+ * logs are readable and the result is stable for files of similar sizes.
+ */
+function getChunkSize(fileSize) {
+  if (fileSize <= MIN_CHUNK_SIZE) return Math.max(1, fileSize);
+
+  const targetSize = Math.ceil(fileSize / TARGET_CHUNKS_PER_FILE);
+  const roundedToKiB = Math.ceil(targetSize / 1024) * 1024;
+  return Math.min(MAX_CHUNK_SIZE, Math.max(MIN_CHUNK_SIZE, roundedToKiB));
+}
 
 /** Wait until a data channel's outgoing buffer has drained below the threshold. */
 async function waitForBufferedAmountBelow(dc, threshold, log) {
@@ -554,6 +570,7 @@ export class TransferManager {
 
         this.activeIncoming.set(msg.transferId, {
           fileName: msg.fileName, fileSize: msg.fileSize, mimeType: msg.mimeType,
+          chunkSize: msg.chunkSize,
           totalChunks: msg.totalChunks,
           chunks: existingChunks,
           receivedChunks: storedChunks,
@@ -568,6 +585,7 @@ export class TransferManager {
           fileName: msg.fileName,
           fileSize: msg.fileSize,
           mimeType: msg.mimeType,
+          chunkSize: msg.chunkSize,
           totalChunks: msg.totalChunks,
           sha256: msg.sha256 || null,
           senderPath: msg.path,
@@ -619,13 +637,13 @@ export class TransferManager {
       return;
     }
 
-    // Decode header: [chunkIndex:u16][tidLen:u16][transferId:utf8][payload]
+    // Decode header: [chunkIndex:u32][tidLen:u16][transferId:utf8][payload]
     const view = new DataView(buffer);
-    const chunkIndex = view.getUint16(0, true);
-    const tidLen     = view.getUint16(2, true);
+    const chunkIndex = view.getUint32(0, true);
+    const tidLen     = view.getUint16(4, true);
     const enc        = new TextDecoder();
-    const transferId = enc.decode(new Uint8Array(buffer, 4, tidLen));
-    const payload    = buffer.slice(4 + tidLen);
+    const transferId = enc.decode(new Uint8Array(buffer, 6, tidLen));
+    const payload    = buffer.slice(6 + tidLen);
 
     st.receivedInBatch++;
 
@@ -786,11 +804,11 @@ export class TransferManager {
   _encodeChunk(chunkIndex, transferId, payloadBuffer) {
     const enc = new TextEncoder();
     const tidBytes = enc.encode(transferId);
-    const header = new ArrayBuffer(4 + tidBytes.byteLength);
+    const header = new ArrayBuffer(6 + tidBytes.byteLength);
     const hv = new DataView(header);
-    hv.setUint16(0, chunkIndex, true);
-    hv.setUint16(2, tidBytes.byteLength, true);
-    new Uint8Array(header, 4).set(tidBytes);
+    hv.setUint32(0, chunkIndex, true);
+    hv.setUint16(4, tidBytes.byteLength, true);
+    new Uint8Array(header, 6).set(tidBytes);
 
     const out = new Uint8Array(header.byteLength + payloadBuffer.byteLength);
     out.set(new Uint8Array(header), 0);
@@ -810,14 +828,15 @@ export class TransferManager {
     this.log(`  same root (${dsu.find(selfId)}) — connected`, 'ok');
 
     const buffer = await file.arrayBuffer();
-    const totalChunks = Math.max(1, Math.ceil(buffer.byteLength / CHUNK_SIZE));
+    const chunkSize = getChunkSize(buffer.byteLength);
+    const totalChunks = Math.max(1, Math.ceil(buffer.byteLength / chunkSize));
     const rawChunks = [];
     for (let i = 0; i < totalChunks; i++) {
-      rawChunks.push(buffer.slice(i * CHUNK_SIZE, Math.min(buffer.byteLength, (i + 1) * CHUNK_SIZE)));
+      rawChunks.push(buffer.slice(i * chunkSize, Math.min(buffer.byteLength, (i + 1) * chunkSize)));
     }
 
     const transferId = `${selfId}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    this.log(`Chunking ${file.name}: ${buffer.byteLength} bytes → ${totalChunks} chunks of ${CHUNK_SIZE}B`, 'hi');
+    this.log(`Chunking ${file.name}: ${buffer.byteLength} bytes → ${totalChunks} chunks of up to ${chunkSize}B`, 'hi');
 
     // Pre-compute SHA-256 hash
     const fileHash = await sha256Hex(buffer);
@@ -830,6 +849,7 @@ export class TransferManager {
       transferId,
       fileName: file.name,
       fileSize: buffer.byteLength,
+      chunkSize,
       totalChunks,
       sha256: fileHash,
       status: 'active',
@@ -894,7 +914,7 @@ export class TransferManager {
       const batchChunks = Math.min(MAX_BATCH_CHUNKS, totalChunks - sentIndex);
       const meta = {
         type: 'file-meta', transferId, path, totalChunks, startIndex: sentIndex,
-        batchChunks, fileName: file.name, fileSize: buffer.byteLength,
+        batchChunks, fileName: file.name, fileSize: buffer.byteLength, chunkSize,
         mimeType: file.type || 'application/octet-stream', continuation,
         sha256: fileHash,
       };
