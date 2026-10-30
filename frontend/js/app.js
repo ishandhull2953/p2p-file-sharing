@@ -16,6 +16,35 @@ let mstOn = false;       // header MST toggle state
 let sendState = null;    // {totalChunks, sent, startedAt} while a send is in progress
 let recvState = null;    // {transferId, totalChunks, startedAt} while a receive is in progress
 let hoveredNode = null;
+let currentTransferId = null;
+let isTransferPaused = false;
+
+function showTransferControls(transferId) {
+  currentTransferId = transferId;
+  isTransferPaused = false;
+  const ctrls = document.getElementById('transferControls');
+  if (ctrls) ctrls.style.display = 'flex';
+  updatePauseResumeButton(false);
+  const badge = document.getElementById('storageBadgeText');
+  if (badge) badge.textContent = 'IndexedDB active';
+}
+
+function hideTransferControls() {
+  currentTransferId = null;
+  isTransferPaused = false;
+  const ctrls = document.getElementById('transferControls');
+  if (ctrls) ctrls.style.display = 'none';
+}
+
+function updatePauseResumeButton(paused) {
+  isTransferPaused = paused;
+  const lbl = document.getElementById('btnPauseResumeLabel');
+  const pIcon = document.getElementById('pauseIcon');
+  const rIcon = document.getElementById('resumeIcon');
+  if (lbl) lbl.textContent = paused ? 'Resume transfer' : 'Pause transfer';
+  if (pIcon) pIcon.style.display = paused ? 'none' : 'block';
+  if (rIcon) rIcon.style.display = paused ? 'block' : 'none';
+}
 
 /* ---------------------------------------------------------------
  * Trace log
@@ -50,21 +79,52 @@ const transferManager = new TransferManager({
       render();
     },
     onSendStart(transferId, meta) {
-      sendState = { totalChunks: meta.totalChunks, sent: 0, startedAt: performance.now(), sizeBytes: meta.fileSize };
+      // A reroute can resend a lower-numbered chunk. Keep unique chunk indices
+      // so the sender's UI never moves backwards after a retransmission.
+      sendState = {
+        totalChunks: meta.totalChunks,
+        sent: 0,
+        sentChunks: new Set(),
+        startedAt: performance.now(),
+        sizeBytes: meta.fileSize,
+      };
       document.getElementById('transferMeta').innerHTML =
         `Sending <b>${meta.fileName}</b> (${meta.fileSize.toLocaleString()} bytes, ${meta.totalChunks} chunks)`;
       document.getElementById('downloadWrap').style.display = 'none';
+      const verifyBadge = document.getElementById('hashVerifyBadge');
+      if (verifyBadge) verifyBadge.style.display = 'none';
       setupProgressUI(meta.totalChunks);
       setChunkStatsVisible(true);
+      showTransferControls(transferId);
     },
     onPathUsed(path) { activePath = path; startPacketAnimation(path); render(); },
     onChunkSent(idx, total) {
-      if (sendState) sendState.sent = idx + 1;
-      markProgress(idx, total);
+      if (sendState) {
+        sendState.sentChunks.add(idx);
+        sendState.sent = sendState.sentChunks.size;
+      }
+      markChunkProgress(idx, sendState?.sent ?? idx + 1, total);
       advancePacket((idx + 1) / total);
       updateChunkStats(sendState);
     },
-    onSendComplete() { log('Send complete.', 'ok'); stopPacketAnimation(); },
+    onSendComplete() {
+      // Completion means the receiver confirmed every chunk, including any
+      // chunks resent after a route change.
+      if (sendState) {
+        sendState.sent = sendState.totalChunks;
+        for (let idx = 0; idx < sendState.totalChunks; idx++) sendState.sentChunks.add(idx);
+        markChunkProgress(sendState.totalChunks - 1, sendState.totalChunks, sendState.totalChunks);
+        updateChunkStats(sendState);
+      }
+      log('Send complete.', 'ok');
+      stopPacketAnimation();
+      hideTransferControls();
+    },
+    onSendFailed() {
+      log('Send incomplete — the receiver did not confirm all chunks.', 'err');
+      stopPacketAnimation();
+      hideTransferControls();
+    },
 
     onIncomingPath(path) { activePath = path; startPacketAnimation(path); render(); },
     onReceiveStart(transferId, rec) {
@@ -72,13 +132,24 @@ const transferManager = new TransferManager({
       document.getElementById('transferMeta').innerHTML =
         `Receiving <b>${rec.fileName}</b> (${rec.fileSize.toLocaleString()} bytes, ${rec.totalChunks} chunks)`;
       document.getElementById('downloadWrap').style.display = 'none';
+      const verifyBadge = document.getElementById('hashVerifyBadge');
+      if (verifyBadge) verifyBadge.style.display = 'none';
       setupProgressUI(rec.totalChunks);
       setChunkStatsVisible(true);
+      showTransferControls(transferId);
+
+      // Restore UI progress if resuming with already-persisted chunks
+      if (rec.receivedChunks && rec.receivedChunks.size > 0) {
+        for (const idx of rec.receivedChunks) {
+          markChunkProgress(idx, rec.receivedChunks.size, rec.totalChunks);
+        }
+        updateChunkStats(recvState, rec.bytesReceived, rec.receivedChunks.size);
+      }
     },
-    onReceiveChunk(transferId, rec) {
-      markProgress(rec.chunks.length - 1, rec.totalChunks);
+    onReceiveChunk(transferId, rec, chunkIndex) {
+      markChunkProgress(chunkIndex, rec.receivedChunks.size, rec.totalChunks);
       advancePacket(rec.bytesReceived / rec.fileSize);
-      updateChunkStats(recvState, rec.bytesReceived);
+      updateChunkStats(recvState, rec.bytesReceived, rec.receivedChunks.size);
     },
     onReceiveComplete(transferId, rec) {
       // rec.chunks is now a single merged ArrayBuffer (from _finalizeReceive)
@@ -89,6 +160,7 @@ const transferManager = new TransferManager({
       document.getElementById('downloadWrap').style.display = 'block';
       log(`Transfer complete — ${rec.bytesReceived.toLocaleString()} bytes reassembled at ${selfId}`, 'ok');
       stopPacketAnimation();
+      hideTransferControls();
     },
     onVerifyResult(transferId, ok, expectedHash) {
       const badge = document.getElementById('hashVerifyBadge');
@@ -102,6 +174,16 @@ const transferManager = new TransferManager({
     onChunkAck(transferId, chunkIndex, received, total) {
       // Optional: could light up individual chunk cells in a different color.
       // For now just track silently (the NACK logic handles reliability).
+    },
+    onTransferPaused(transferId) {
+      updatePauseResumeButton(true);
+    },
+    onTransferResumed(transferId) {
+      updatePauseResumeButton(false);
+    },
+    onStorageProgress(transferId, count, total) {
+      const badge = document.getElementById('storageBadgeText');
+      if (badge) badge.textContent = `IndexedDB: ${count}/${total} chunks`;
     },
     onRelayNotice(path) {
       activePath = path;
@@ -148,6 +230,11 @@ socket.on('topology-update', ({ topology, event }) => {
 });
 
 socket.on('signal', (msg) => transferManager.handleSignal(msg));
+
+socket.on('mesh-connect', ({ targetPeerId, isOfferer }) => {
+  log(`Mesh self-healing: connecting to ${targetPeerId} (${isOfferer ? 'offerer' : 'answerer'})...`, 'hi');
+  transferManager.connectToNeighbor(targetPeerId, isOfferer);
+});
 
 /* ---------------------------------------------------------------
  * SVG rendering
@@ -404,6 +491,9 @@ function advancePacket(progress) {
 function setupProgressUI(totalChunks) {
   const grid = document.getElementById('chunkGrid');
   const track = document.getElementById('progressTrack');
+  const fill = document.getElementById('progressFill');
+  if (fill) fill.style.width = '0%';
+
   if (totalChunks <= GRID_CELL_LIMIT) {
     track.style.display = 'none';
     grid.style.display = 'grid';
@@ -417,26 +507,27 @@ function setupProgressUI(totalChunks) {
   } else {
     grid.style.display = 'none';
     track.style.display = 'block';
-    document.getElementById('progressFill').style.width = '0%';
   }
   document.getElementById('statChunkCount').textContent = totalChunks;
+  document.getElementById('statRatio').textContent = `0/${totalChunks}`;
+  document.getElementById('statSpeed').textContent = '–';
 }
 
-function markProgress(idx, total) {
+function markChunkProgress(chunkIndex, doneCount, total) {
   if (total <= GRID_CELL_LIMIT) {
-    const cell = document.getElementById('chunk-' + idx);
+    const cell = document.getElementById('chunk-' + chunkIndex);
     if (cell) cell.classList.add('done');
-  } else {
-    const pct = Math.min(100, Math.round(((idx + 1) / total) * 100));
-    document.getElementById('progressFill').style.width = pct + '%';
   }
+  const pct = Math.min(100, Math.round((doneCount / total) * 100));
+  const fill = document.getElementById('progressFill');
+  if (fill) fill.style.width = pct + '%';
 }
 
 function setChunkStatsVisible(visible) {
   document.getElementById('chunkStats').style.display = visible ? 'grid' : 'none';
 }
 
-function updateChunkStats(state, bytesOverride) {
+function updateChunkStats(state, bytesOverride, countOverride) {
   if (!state) return;
   const elapsedSec = Math.max(0.05, (performance.now() - state.startedAt) / 1000);
   const bytesDone = bytesOverride !== undefined
@@ -444,9 +535,13 @@ function updateChunkStats(state, bytesOverride) {
     : (state.sent / state.totalChunks) * state.sizeBytes;
   const speedMBs = (bytesDone / 1e6) / elapsedSec;
   document.getElementById('statSpeed').textContent = `${speedMBs.toFixed(1)} MB/s`;
-  const doneCount = bytesOverride !== undefined
-    ? Math.round((bytesOverride / state.sizeBytes) * state.totalChunks)
-    : state.sent;
+
+  let doneCount = state.sent;
+  if (countOverride !== undefined) {
+    doneCount = countOverride;
+  } else if (bytesOverride !== undefined) {
+    doneCount = Math.min(state.totalChunks, Math.round((bytesOverride / state.sizeBytes) * state.totalChunks));
+  }
   document.getElementById('statRatio').textContent = `${doneCount}/${state.totalChunks}`;
 }
 
@@ -539,9 +634,24 @@ document.getElementById('btnSend').onclick = async () => {
   if (!receiverId) { log('No receiver available yet.', 'err'); return; }
   const btn = document.getElementById('btnSend');
   btn.disabled = true;
+  btn.textContent = 'Sending...';
   try {
     await transferManager.sendFile(fileInput.files[0], receiverId, currentAlgo);
   } finally {
     btn.disabled = false;
+    btn.textContent = 'Send file';
+    fileInput.value = '';
+    const hashBox = document.getElementById('hashBox');
+    if (hashBox) hashBox.style.display = 'none';
   }
 };
+
+document.getElementById('btnPauseResume').onclick = () => {
+  if (!currentTransferId) return;
+  if (!isTransferPaused) {
+    transferManager.pauseTransfer(currentTransferId);
+  } else {
+    transferManager.resumeTransfer(currentTransferId);
+  }
+};
+

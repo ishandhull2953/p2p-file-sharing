@@ -1,4 +1,5 @@
 import { bfsPath, dfsPath, dijkstraPath, buildDSU } from './algorithms.js';
+import { TransferStorage } from './storage.js';
 
 // Baseline fallback if the server doesn't hand us TURN credentials (see server.js
 // for how to configure your own free Metered.ca TURN credentials). STUN-only is
@@ -14,11 +15,14 @@ const MAX_BUFFERED_AMOUNT = 256 * 1024; // don't queue more than this much unsen
 const BUFFER_DRAIN_TIMEOUT_MS = 8000;
 const LATENCY_PROBE_INTERVAL_MS = 3000;
 // How long (ms) the sender waits for an ACK from the receiver before timing out a batch
-const ACK_TIMEOUT_MS = 15000;
+const ACK_TIMEOUT_MS = 4000;
 // How long (ms) the sender waits for NACK/retransmit round-trip to settle
-const NACK_WAIT_MS = 3000;
+const NACK_WAIT_MS = 400;
 // How many retransmit rounds are attempted before giving up
 const MAX_RETRANSMIT_ROUNDS = 5;
+// Keep batches small so a topology change can be noticed and routed around
+// before a whole file is handed to a relay with a broken downstream link.
+const MAX_BATCH_CHUNKS = 32;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -111,20 +115,18 @@ function _sha256Fallback(buffer) {
 /**
  * TransferManager owns every RTCPeerConnection/RTCDataChannel this peer
  * holds, and implements the application-layer relay protocol on top of
- * them. Key upgrades in this version:
+ * them:
  *
  *  1. Every chunk carries (fileId, chunkIndex, totalChunks) metadata in a
- *     4-byte header prepended to the raw payload.
- *  2. The receiver tracks received chunk indices in a Set (receivedChunks)
- *     and replies with ACK / NACK messages.
- *  3. The sender detects WebRTC disconnection mid-transfer and reroutes
- *     using the existing BFS/DFS/Dijkstra routing system.
- *  4. After sending all chunks the sender requests a NACK report, and
- *     retransmits only the missing chunks — repeating until the receiver
- *     confirms all chunks arrived or we hit MAX_RETRANSMIT_ROUNDS.
- *  5. The receiver performs SHA-256 verification once reconstruction is
- *     complete, comparing against the hash the sender included in the
- *     file-meta frame.
+ *     binary header prepended to the raw payload.
+ *  2. The receiver persists chunks into IndexedDB as they arrive, maintaining
+ *     receivedChunks across sessions and avoiding browser RAM exhaustion.
+ *  3. Pause and Resume: transfers can be paused mid-flight by sender or receiver;
+ *     state is preserved in IndexedDB and resumes from the exact checkpoint.
+ *  4. Receiver tracks received chunk indices and replies with ACK / NACK messages.
+ *  5. WebRTC disconnection detection mid-transfer triggers automatic rerouting.
+ *  6. Retransmit phase: only missing chunks are requested and resent.
+ *  7. Receiver performs SHA-256 integrity verification upon reassembly.
  */
 export class TransferManager {
   constructor({ graph, socket, getSelfId, log, ui }) {
@@ -133,7 +135,8 @@ export class TransferManager {
     this.getSelfId = getSelfId;
     this.log = log;
     this.ui = ui; // { onLinkState, onLatencyMeasured, onSendStart, onPathUsed, onChunkSent, onSendComplete,
-                  //   onReceiveStart, onReceiveChunk, onReceiveComplete, onRelayNotice, onVerifyResult }
+                  //   onReceiveStart, onReceiveChunk, onReceiveComplete, onRelayNotice, onVerifyResult,
+                  //   onTransferPaused, onTransferResumed, onStorageProgress }
 
     this.peerConnections = new Map(); // neighborId -> RTCPeerConnection
     this.dataChannels = new Map();    // neighborId -> RTCDataChannel
@@ -143,6 +146,16 @@ export class TransferManager {
     this.latencyProbeTimers = new Map(); // neighborId -> interval id
     this.latencyProbeSentAt = new Map(); // "neighbor:probeId" -> performance timestamp
     this.iceServers = FALLBACK_ICE_SERVERS;
+
+    // Persistent storage via IndexedDB
+    this.storage = new TransferStorage();
+
+    // Pause/Resume tracking
+    this.pausedTransfers = new Set();    // set of transferIds currently paused
+    this._resumeResolvers = new Map();   // transferId -> resolver function
+    this.activeSenders = new Map();      // transferId -> sender metadata { currentPath, ... }
+    this.completedTransfers = new Set(); // transferIds that receiver finished
+    this.failedRoutes = new Map();       // transferId -> { failedPeer, chunkIndex, reason }
 
     // Pending ACK/NACK resolvers: transferId -> { resolveAck, resolveNack }
     this._ackResolvers = new Map();
@@ -165,12 +178,13 @@ export class TransferManager {
    * ----------------------------------------------------------- */
 
   connectToNeighbor(neighborId, isOfferer) {
-    if (this.peerConnections.has(neighborId)) return;
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    let pc = this.peerConnections.get(neighborId);
+    if (pc) {
+      if (!['failed', 'closed'].includes(pc.connectionState)) return;
+      this.closeNeighbor(neighborId);
+    }
+    pc = new RTCPeerConnection({ iceServers: this.iceServers });
     this.peerConnections.set(neighborId, pc);
-    // IMPORTANT: don't stomp on candidates that may have already arrived and
-    // been queued for this neighbor before this side even knew a connection
-    // was starting (a real, common race — see handleSignal's else-branch).
     if (!this.pendingCandidates.has(neighborId)) this.pendingCandidates.set(neighborId, []);
 
     this.log(`RTCPeerConnection created for ${neighborId} (${isOfferer ? 'offerer' : 'answerer'})`);
@@ -188,11 +202,11 @@ export class TransferManager {
     pc.onsignalingstatechange = () => this.log(`Signaling state (${neighborId}): ${pc.signalingState}`);
     pc.onconnectionstatechange = () => {
       this.log(`Connection state (${neighborId}): ${pc.connectionState}`);
-      if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) {
+      if (['failed', 'closed'].includes(pc.connectionState)) {
         this.ui.onLinkState(neighborId, 'closed');
-        // ── Step 6: Detect WebRTC disconnection ──
-        // Signal the data-channel close path (if it hasn't fired yet) so the
-        // sender's rerouting logic in sendFile() picks it up immediately.
+        this.closeNeighbor(neighborId);
+      } else if (pc.connectionState === 'disconnected') {
+        this.ui.onLinkState(neighborId, 'closed');
         this._handleNeighborGone(neighborId);
       }
     };
@@ -225,9 +239,14 @@ export class TransferManager {
 
   async flushCandidates(neighborId) {
     const pc = this.peerConnections.get(neighborId);
+    if (!pc) return;
     const queued = this.pendingCandidates.get(neighborId) || [];
     for (const c of queued) {
-      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (_) { /* best-effort */ }
+      try {
+        if (c && pc.remoteDescription) {
+          await pc.addIceCandidate(new RTCIceCandidate(c));
+        }
+      } catch (_) { /* best-effort */ }
     }
     this.pendingCandidates.set(neighborId, []);
   }
@@ -236,6 +255,24 @@ export class TransferManager {
     let pc = this.peerConnections.get(from);
     this.log(`Signal received from ${from}: ${data.type}`);
     if (data.type === 'offer') {
+      const selfId = this.getSelfId();
+      const isOfferCollision = pc && pc.signalingState !== 'stable';
+      const isPolite = selfId ? selfId.localeCompare(from) > 0 : true;
+
+      if (isOfferCollision) {
+        if (!isPolite) {
+          this.log(`Offer collision with ${from} — ignoring incoming offer (impolite peer)`, 'warn');
+          return;
+        }
+        this.log(`Offer collision with ${from} — rolling back local description (polite peer)`, 'warn');
+        try {
+          await pc.setLocalDescription({ type: 'rollback' });
+        } catch (_) {
+          this.closeNeighbor(from);
+          pc = null;
+        }
+      }
+
       if (!pc) { this.connectToNeighbor(from, false); pc = this.peerConnections.get(from); }
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
@@ -284,21 +321,13 @@ export class TransferManager {
       this.stopLatencyProbes(neighborId);
       this.log(`Data channel closed: ${neighborId}`, 'warn');
       this.ui.onLinkState(neighborId, 'closed');
-      // ── Step 6: Detect WebRTC disconnection ──
       this._handleNeighborGone(neighborId);
     };
     dc.onerror = (e) => this.log(`Data channel error (${neighborId}): ${e?.error?.message || 'unknown'}`, 'err');
     dc.onmessage = (e) => this.handleIncomingMessage(neighborId, e.data);
   }
 
-  /**
-   * Called whenever a neighbor's data channel closes or the peer connection
-   * transitions to failed/closed/disconnected. Cleans up local state.
-   */
   _handleNeighborGone(neighborId) {
-    // Nothing extra needed here beyond what closeNeighbor() does — the sender's
-    // main loop in sendFile() checks dc.readyState on every chunk and reroutes
-    // automatically. This hook is a single integration point for future extension.
     this.log(`Neighbor ${neighborId} gone — sender will reroute if a transfer is in progress.`, 'warn');
   }
 
@@ -335,6 +364,143 @@ export class TransferManager {
   }
 
   /* -------------------------------------------------------------
+   * Pause / Resume Control
+   * ----------------------------------------------------------- */
+
+  pauseTransfer(transferId) {
+    if (!transferId) return;
+    this.pausedTransfers.add(transferId);
+    this.storage.updateTransferStatus(transferId, 'paused');
+    this.log(`Transfer ${transferId} paused. State & chunks stored in IndexedDB.`, 'warn');
+
+    // Notify peer
+    const rec = this.activeIncoming.get(transferId);
+    if (rec && rec.senderPath) {
+      // Receiver initiated pause: send towards sender along reversePath
+      const revPath = [...rec.senderPath].reverse();
+      this._sendControlWithPath({ type: 'transfer-pause', transferId, path: revPath });
+    } else {
+      // Sender initiated pause: send towards receiver along active path
+      const senderRecord = this.activeSenders.get(transferId);
+      if (senderRecord && senderRecord.currentPath) {
+        this._sendControlWithPath({ type: 'transfer-pause', transferId, path: senderRecord.currentPath });
+      }
+    }
+
+    this.ui.onTransferPaused?.(transferId);
+  }
+
+  resumeTransfer(transferId) {
+    if (!transferId) return;
+    this.pausedTransfers.delete(transferId);
+    this.storage.updateTransferStatus(transferId, 'active');
+
+    // Unblock sender loop if waiting
+    const resolver = this._resumeResolvers.get(transferId);
+    if (resolver) {
+      this._resumeResolvers.delete(transferId);
+      resolver();
+    }
+
+    // Notify peer
+    const rec = this.activeIncoming.get(transferId);
+    if (rec && rec.senderPath) {
+      const revPath = [...rec.senderPath].reverse();
+      this._sendControlWithPath({ type: 'transfer-resume', transferId, path: revPath });
+    } else {
+      const senderRecord = this.activeSenders.get(transferId);
+      if (senderRecord && senderRecord.currentPath) {
+        this._sendControlWithPath({ type: 'transfer-resume', transferId, path: senderRecord.currentPath });
+      }
+    }
+
+    this.log(`Transfer ${transferId} resumed from IndexedDB checkpoint.`, 'ok');
+    this.ui.onTransferResumed?.(transferId);
+  }
+
+  _sendControlWithPath(msg) {
+    if (!msg.path || msg.path.length < 2) return;
+    const selfId = this.getSelfId();
+    const hopIndex = msg.path.indexOf(selfId);
+    if (hopIndex === -1 || hopIndex >= msg.path.length - 1) return;
+    const nextHop = msg.path[hopIndex + 1];
+    const dc = this.dataChannels.get(nextHop);
+    if (dc && dc.readyState === 'open') {
+      dc.send(JSON.stringify(msg));
+    }
+  }
+
+  _handleRemotePause(fromNeighborId, msg) {
+    const isDest = this._relayControlMessage(msg);
+    if (isDest) {
+      this.pausedTransfers.add(msg.transferId);
+      this.storage.updateTransferStatus(msg.transferId, 'paused');
+      this.log(`Transfer ${msg.transferId} paused by remote peer. Chunks preserved in IndexedDB.`, 'warn');
+      this.ui.onTransferPaused?.(msg.transferId);
+    }
+  }
+
+  _handleRemoteResume(fromNeighborId, msg) {
+    const isDest = this._relayControlMessage(msg);
+    if (isDest) {
+      this.pausedTransfers.delete(msg.transferId);
+      this.storage.updateTransferStatus(msg.transferId, 'active');
+      const resolver = this._resumeResolvers.get(msg.transferId);
+      if (resolver) {
+        this._resumeResolvers.delete(msg.transferId);
+        resolver();
+      }
+      this.log(`Transfer ${msg.transferId} resumed by remote peer.`, 'ok');
+      this.ui.onTransferResumed?.(msg.transferId);
+    }
+  }
+
+  _relayControlMessage(msg) {
+    const selfId = this.getSelfId();
+    if (!msg.path || !Array.isArray(msg.path)) return true;
+    const hopIndex = msg.path.indexOf(selfId);
+    if (hopIndex === -1) return true;
+    const isDestination = hopIndex === msg.path.length - 1;
+    if (isDestination) return true;
+
+    const nextHop = msg.path[hopIndex + 1];
+    const outDc = this.dataChannels.get(nextHop);
+    if (outDc && outDc.readyState === 'open') {
+      outDc.send(JSON.stringify(msg));
+      this.log(`Relayed ${msg.type} towards ${msg.path[msg.path.length - 1]} via ${nextHop}`);
+    } else {
+      this.log(`Cannot relay ${msg.type} — link to ${nextHop} is not open`, 'warn');
+    }
+    return false;
+  }
+
+  /** Tell the sender that an intermediate relay can no longer reach its next hop. */
+  _reportRouteFailure(st, chunkIndex, reason) {
+    if (!st.path) return;
+    if (st.routeFailureReported) return;
+    st.routeFailureReported = true;
+    this.log(`Cannot forward chunk ${chunkIndex} — ${reason}`, 'err');
+    this._sendControlWithPath({
+      type: 'route-failed',
+      transferId: st.transferId,
+      failedPeer: st.forwardTo,
+      chunkIndex,
+      reason,
+      path: [...st.path].reverse(),
+    });
+  }
+
+  _handleRouteFailed(fromNeighborId, msg) {
+    if (!this._relayControlMessage(msg)) return;
+    this.failedRoutes.set(msg.transferId, {
+      failedPeer: msg.failedPeer,
+      chunkIndex: Number.isInteger(msg.chunkIndex) ? msg.chunkIndex : 0,
+      reason: msg.reason || 'a relay lost its next hop',
+    });
+    this.log(`Route failure reported by relay: ${msg.reason || msg.failedPeer}. Rerouting…`, 'warn');
+  }
+
+  /* -------------------------------------------------------------
    * Receiving / relaying
    * ----------------------------------------------------------- */
 
@@ -347,15 +513,16 @@ export class TransferManager {
       else if (msg.type === 'transfer-abort')  this.channelState.delete(fromNeighborId);
       else if (msg.type === 'latency-ping')    this.replyToLatencyPing(fromNeighborId, msg);
       else if (msg.type === 'latency-pong')    this.recordLatency(fromNeighborId, msg);
-      // ── Step 4: ACK messages ──
       else if (msg.type === 'chunk-ack')       this._handleAck(fromNeighborId, msg);
-      // ── Steps 8–9: missing-chunk / retransmit protocol ──
       else if (msg.type === 'request-nack')    this._handleRequestNack(fromNeighborId, msg);
       else if (msg.type === 'nack-report')     this._handleNackReport(fromNeighborId, msg);
       else if (msg.type === 'retransmit-meta') this.handleMeta(fromNeighborId, msg);
+      else if (msg.type === 'transfer-pause')  this._handleRemotePause(fromNeighborId, msg);
+      else if (msg.type === 'transfer-resume') this._handleRemoteResume(fromNeighborId, msg);
+      else if (msg.type === 'transfer-complete-ack') this._handleTransferCompleteAck(fromNeighborId, msg);
+      else if (msg.type === 'route-failed') this._handleRouteFailed(fromNeighborId, msg);
       return;
     }
-    // ── Step 1: binary chunk with (fileId, chunkIndex) header ──
     this.handleChunk(fromNeighborId, data);
   }
 
@@ -370,43 +537,62 @@ export class TransferManager {
     if (sentAt === undefined) return;
     this.latencyProbeSentAt.delete(key);
     const rttMs = Math.max(1, Math.round(performance.now() - sentAt));
-    // Update this peer immediately. The server also publishes the value so
-    // every peer can use it when calculating a multi-hop Dijkstra route.
     this.ui.onLatencyMeasured?.(fromNeighborId, rttMs);
     this.socket.emit('link-latency', { neighborId: fromNeighborId, latencyMs: rttMs });
   }
 
-  handleMeta(fromNeighborId, msg) {
+  async handleMeta(fromNeighborId, msg) {
     const selfId = this.getSelfId();
     const hopIndex = msg.path.indexOf(selfId);
     const isDestination = hopIndex === msg.path.length - 1;
 
     if (isDestination) {
       if (!msg.continuation || !this.activeIncoming.has(msg.transferId)) {
-        // ── Step 3: Receiver stores chunks; Step 5: Maintain receivedChunks ──
+        // Query IndexedDB for any previously stored chunks for this transfer
+        const storedChunks = await this.storage.getStoredChunkIndices(msg.transferId);
+        const existingChunks = new Array(msg.totalChunks);
+
         this.activeIncoming.set(msg.transferId, {
           fileName: msg.fileName, fileSize: msg.fileSize, mimeType: msg.mimeType,
           totalChunks: msg.totalChunks,
-          // indexed array: slot i holds ArrayBuffer for chunk i (or undefined)
-          chunks: new Array(msg.totalChunks),
-          // set of indices we have confirmed received
-          receivedChunks: new Set(),
+          chunks: existingChunks,
+          receivedChunks: storedChunks,
           bytesReceived: 0,
           startedAt: performance.now(),
-          // SHA-256 hash the sender computed — we verify against this
           sha256: msg.sha256 || null,
-          // who to send ACKs / NACKs back toward
           senderPath: msg.path,
         });
+
+        await this.storage.saveTransferMeta({
+          transferId: msg.transferId,
+          fileName: msg.fileName,
+          fileSize: msg.fileSize,
+          mimeType: msg.mimeType,
+          totalChunks: msg.totalChunks,
+          sha256: msg.sha256 || null,
+          senderPath: msg.path,
+          status: 'active',
+          isSender: false,
+        });
+
         this.ui.onReceiveStart(msg.transferId, this.activeIncoming.get(msg.transferId));
+        if (storedChunks.size > 0) {
+          this.log(`IndexedDB checkpoint found: ${storedChunks.size}/${msg.totalChunks} chunks already persisted!`, 'ok');
+          this.ui.onStorageProgress?.(msg.transferId, storedChunks.size, msg.totalChunks);
+        }
       }
-      // Let the UI show the full inbound route too, not just the sender's view of it.
       this.ui.onIncomingPath?.(msg.path);
       this.channelState.set(fromNeighborId, {
         transferId: msg.transferId, isDestination: true,
         batchChunks: msg.batchChunks, receivedInBatch: 0, startIndex: msg.startIndex,
       });
-      this.log(`Receiving "${msg.fileName}" — batch of ${msg.batchChunks} chunk(s) via ${fromNeighborId}`, 'hi');
+      const rec = this.activeIncoming.get(msg.transferId);
+      if (rec) rec.senderPath = msg.path;
+      const incoming = this.activeIncoming.get(msg.transferId);
+      this.log(
+        `Receiving "${incoming?.fileName || msg.fileName || 'file'}" — batch of ${msg.batchChunks} chunk(s) via ${fromNeighborId}`,
+        'hi',
+      );
     } else {
       const nextHop = msg.path[hopIndex + 1];
       const outDc = this.dataChannels.get(nextHop);
@@ -415,7 +601,8 @@ export class TransferManager {
         outDc.send(JSON.stringify(msg));
         this.channelState.set(fromNeighborId, {
           transferId: msg.transferId, isDestination: false,
-          forwardTo: nextHop, batchChunks: msg.batchChunks, receivedInBatch: 0,
+          forwardTo: nextHop, path: msg.path,
+          batchChunks: msg.batchChunks, receivedInBatch: 0,
         });
         this.log(`Relaying "${msg.fileName}" toward ${msg.path[msg.path.length - 1]} — next hop ${nextHop}`, 'hi');
       } else {
@@ -424,27 +611,15 @@ export class TransferManager {
     }
   }
 
-  /**
-   * ── Steps 1–3: Chunk with embedded (fileId, chunkIndex) header ──
-   *
-   * Wire format (binary message):
-   *   Bytes 0–1  : chunkIndex  (Uint16, little-endian, 0-based)
-   *   Bytes 2–3  : transferId length N (Uint16 LE)
-   *   Bytes 4–(4+N-1): transferId (UTF-8 string)
-   *   Bytes (4+N)–end: raw chunk payload
-   *
-   * This allows any relay node (and the receiver) to identify which chunk
-   * this is without relying on arrival order.
-   */
   handleChunk(fromNeighborId, buffer) {
     const st = this.channelState.get(fromNeighborId);
-    if (!st) return; // stray chunk with no matching meta — drop it
+    if (!st) return;
     if (!(buffer instanceof ArrayBuffer)) {
       this.log(`Expected binary chunk from ${fromNeighborId}, got ${Object.prototype.toString.call(buffer)} — dropping`, 'err');
       return;
     }
 
-    // ── Decode header ──
+    // Decode header: [chunkIndex:u16][tidLen:u16][transferId:utf8][payload]
     const view = new DataView(buffer);
     const chunkIndex = view.getUint16(0, true);
     const tidLen     = view.getUint16(2, true);
@@ -457,112 +632,130 @@ export class TransferManager {
     if (st.isDestination) {
       const rec = this.activeIncoming.get(transferId);
       if (rec) {
-        // ── Step 5: Maintain receivedChunks ──
         if (!rec.receivedChunks.has(chunkIndex)) {
           rec.chunks[chunkIndex] = payload;
           rec.receivedChunks.add(chunkIndex);
           rec.bytesReceived += payload.byteLength;
-          this.ui.onReceiveChunk(transferId, rec);
+
+          // Persist chunk to IndexedDB
+          this.storage.saveChunk(transferId, chunkIndex, payload).catch(err => {
+            console.error('[IndexedDB] saveChunk error:', err);
+          });
+
+          this.ui.onReceiveChunk(transferId, rec, chunkIndex);
+          this.ui.onStorageProgress?.(transferId, rec.receivedChunks.size, rec.totalChunks);
         }
 
-        // ── Step 4: Send ACK back toward the sender ──
+        // Send ACK back toward sender
         this._sendAck(transferId, rec, chunkIndex);
 
-        // Check if all chunks have arrived
+        // Check if all chunks received
         if (rec.receivedChunks.size >= rec.totalChunks) {
-          // ── Step 10: Reconstruct the file ──
-          // ── Step 11: SHA-256 verification ──
           this._finalizeReceive(transferId, rec);
         }
       }
     } else {
-      // Relay: re-encode the same framed buffer as-is (header preserved)
+      // Relay: forward binary buffer as-is
       const outDc = this.dataChannels.get(st.forwardTo);
-      if (outDc && outDc.readyState === 'open') outDc.send(buffer);
+      if (outDc && outDc.readyState === 'open') {
+        try {
+          outDc.send(buffer);
+        } catch (error) {
+          this._reportRouteFailure(st, chunkIndex, error.message);
+        }
+      } else {
+        this._reportRouteFailure(st, chunkIndex, `link to ${st.forwardTo} is not open`);
+      }
     }
 
     if (st.receivedInBatch >= st.batchChunks) this.channelState.delete(fromNeighborId);
   }
 
-  /**
-   * ── Step 4: Send ACK ──
-   * Routes the ACK back along the reverse path so the sender can track progress.
-   * For simplicity we route it back via the from-neighbor (the next hop toward sender).
-   */
   _sendAck(transferId, rec, chunkIndex) {
-    // The senderPath is [sender, ...relays, self]. The ACK goes back on the
-    // same channel we received the chunk from — we just reply to from-neighbor.
-    // Because ACKs are JSON control messages (not file data), we look up who
-    // we received the last meta from by scanning channelState.
-    for (const [neighborId, st] of this.channelState) {
-      if (st.isDestination && st.transferId === transferId) {
-        const dc = this.dataChannels.get(neighborId);
-        if (dc?.readyState === 'open') {
-          dc.send(JSON.stringify({
-            type: 'chunk-ack',
-            transferId,
-            chunkIndex,
-            received: rec.receivedChunks.size,
-            total: rec.totalChunks,
-          }));
-        }
-        return;
-      }
-    }
+    this._sendControlWithPath({
+      type: 'chunk-ack', transferId, chunkIndex,
+      received: rec.receivedChunks.size, total: rec.totalChunks,
+      path: [...rec.senderPath].reverse(),
+    });
   }
 
-  /** ── Step 4: Receive ACK on sender side (or relay — relay just forwards it) ── */
   _handleAck(fromNeighborId, msg) {
+    if (!this._relayControlMessage(msg)) return;
     const resolver = this._ackResolvers.get(msg.transferId);
     if (resolver?.resolveAck) {
       resolver.resolveAck(msg);
     }
-    // Also inform the UI if wired up
     this.ui.onChunkAck?.(msg.transferId, msg.chunkIndex, msg.received, msg.total);
   }
 
-  /**
-   * ── Steps 8–9: NACK protocol ──
-   * Sender sends { type: 'request-nack', transferId } to ask what's missing.
-   * Receiver replies with { type: 'nack-report', transferId, missing: [...indices] }.
-   */
-  _handleRequestNack(fromNeighborId, msg) {
+  _handleTransferCompleteAck(fromNeighborId, msg) {
+    if (!this._relayControlMessage(msg)) return;
+    const resolver = this._ackResolvers.get(msg.transferId);
+    if (resolver?.resolveNack) {
+      resolver.resolveNack({ missing: [] });
+    }
+  }
+
+  async _handleRequestNack(fromNeighborId, msg) {
+    if (!this._relayControlMessage(msg)) return;
     const rec = this.activeIncoming.get(msg.transferId);
-    if (!rec) return;
-    const missing = [];
-    for (let i = 0; i < rec.totalChunks; i++) {
-      if (!rec.receivedChunks.has(i)) missing.push(i);
+    let missing = [];
+    if (rec) {
+      for (let i = 0; i < rec.totalChunks; i++) {
+        if (!rec.receivedChunks.has(i)) missing.push(i);
+      }
+    } else if (this.completedTransfers.has(msg.transferId)) {
+      missing = []; // Already completed and verified
+    } else {
+      const meta = await this.storage.getTransferMeta(msg.transferId);
+      if (meta && meta.status === 'completed') {
+        missing = [];
+      } else {
+        return;
+      }
     }
-    const dc = this.dataChannels.get(fromNeighborId);
-    if (dc?.readyState === 'open') {
-      dc.send(JSON.stringify({ type: 'nack-report', transferId: msg.transferId, missing }));
-    }
+    this._sendControlWithPath({
+      type: 'nack-report', transferId: msg.transferId, missing,
+      path: [...msg.path].reverse(),
+    });
     this.log(`NACK: ${missing.length} chunk(s) missing for ${msg.transferId}`, missing.length ? 'warn' : 'ok');
   }
 
   _handleNackReport(fromNeighborId, msg) {
+    if (!this._relayControlMessage(msg)) return;
     const resolver = this._ackResolvers.get(msg.transferId);
     if (resolver?.resolveNack) {
       resolver.resolveNack(msg);
     }
   }
 
-  /**
-   * ── Step 10: Reconstruct the file ──
-   * ── Step 11: SHA-256 verification ──
-   */
   async _finalizeReceive(transferId, rec) {
+    this.completedTransfers.add(transferId);
     this.activeIncoming.delete(transferId);
 
-    // Concatenate ordered chunks
-    const total = rec.chunks.reduce((s, c) => s + (c?.byteLength || 0), 0);
+    // Notify the sender along the reverse multi-hop path.
+    this._sendControlWithPath({
+      type: 'transfer-complete-ack', transferId,
+      path: [...rec.senderPath].reverse(),
+    });
+
+    // Retrieve all chunks from IndexedDB (or fallback to memory if IndexedDB unavailable)
+    let chunks = await this.storage.getAllChunks(transferId, rec.totalChunks);
+    if (!chunks || chunks.filter(Boolean).length < rec.totalChunks) {
+      chunks = rec.chunks;
+    }
+
+    const total = chunks.reduce((s, c) => s + (c?.byteLength || 0), 0);
     const merged = new Uint8Array(total);
     let offset = 0;
     for (let i = 0; i < rec.totalChunks; i++) {
-      const chunk = rec.chunks[i];
+      const chunk = chunks[i];
       if (chunk) { merged.set(new Uint8Array(chunk), offset); offset += chunk.byteLength; }
     }
     const finalBuffer = merged.buffer;
+
+    // Mark completed in IndexedDB
+    await this.storage.updateTransferStatus(transferId, 'completed');
 
     // SHA-256 verification
     let hashOk = null;
@@ -580,7 +773,7 @@ export class TransferManager {
 
     this.ui.onReceiveComplete(transferId, {
       ...rec,
-      chunks: [finalBuffer], // single merged buffer for Blob construction
+      chunks: [finalBuffer],
       bytesReceived: total,
       hashOk,
     });
@@ -590,10 +783,6 @@ export class TransferManager {
    * Sending
    * ----------------------------------------------------------- */
 
-  /**
-   * Encode a chunk payload into the framed binary format:
-   *   [chunkIndex:Uint16][tidLen:Uint16][transferId:utf8][payload]
-   */
   _encodeChunk(chunkIndex, transferId, payloadBuffer) {
     const enc = new TextEncoder();
     const tidBytes = enc.encode(transferId);
@@ -602,7 +791,7 @@ export class TransferManager {
     hv.setUint16(0, chunkIndex, true);
     hv.setUint16(2, tidBytes.byteLength, true);
     new Uint8Array(header, 4).set(tidBytes);
-    // Concatenate header + payload
+
     const out = new Uint8Array(header.byteLength + payloadBuffer.byteLength);
     out.set(new Uint8Array(header), 0);
     out.set(new Uint8Array(payloadBuffer), header.byteLength);
@@ -620,7 +809,6 @@ export class TransferManager {
     }
     this.log(`  same root (${dsu.find(selfId)}) — connected`, 'ok');
 
-    // ── Step 1: Chunk the file ──
     const buffer = await file.arrayBuffer();
     const totalChunks = Math.max(1, Math.ceil(buffer.byteLength / CHUNK_SIZE));
     const rawChunks = [];
@@ -628,20 +816,33 @@ export class TransferManager {
       rawChunks.push(buffer.slice(i * CHUNK_SIZE, Math.min(buffer.byteLength, (i + 1) * CHUNK_SIZE)));
     }
 
-    // ── Step 2: Assign fileId (= transferId) + chunkIndex ──
     const transferId = `${selfId}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     this.log(`Chunking ${file.name}: ${buffer.byteLength} bytes → ${totalChunks} chunks of ${CHUNK_SIZE}B`, 'hi');
 
-    // Pre-compute SHA-256 hash of the original file buffer so the receiver can verify.
+    // Pre-compute SHA-256 hash
     const fileHash = await sha256Hex(buffer);
     this.log(`SHA-256 (sender): ${fileHash}`, 'hi');
 
-    // Pre-encode every chunk with its framed header so we can retransmit selectively.
     const framedChunks = rawChunks.map((c, idx) => this._encodeChunk(idx, transferId, c));
+
+    // Save transfer record to IndexedDB
+    await this.storage.saveTransferMeta({
+      transferId,
+      fileName: file.name,
+      fileSize: buffer.byteLength,
+      totalChunks,
+      sha256: fileHash,
+      status: 'active',
+      isSender: true,
+      receiverId,
+    });
+
+    this.activeSenders.set(transferId, {
+      file, receiverId, algo, totalChunks, framedChunks, currentPath: null
+    });
 
     this.ui.onSendStart(transferId, { fileName: file.name, fileSize: buffer.byteLength, totalChunks });
 
-    // Register ACK resolver slot
     this._ackResolvers.set(transferId, { resolveAck: null, resolveNack: null });
 
     let sentIndex = 0;
@@ -650,17 +851,25 @@ export class TransferManager {
     let routeWaitAttempts = 0;
     let noProgressStreak = 0;
 
-    // ── Steps 6–7: Detect disconnection + reroute using existing routing system ──
-    // The outer while-loop already re-runs pathfinder on each iteration, which
-    // naturally picks a new route whenever the current next-hop's channel drops.
-
     while (sentIndex < totalChunks) {
+      const pendingFailure = this.failedRoutes.get(transferId);
+      if (pendingFailure) {
+        this.failedRoutes.delete(transferId);
+        sentIndex = Math.min(sentIndex, pendingFailure.chunkIndex);
+        this.log(`Rerouting from chunk ${sentIndex}; relay lost ${pendingFailure.failedPeer}.`, 'warn');
+      }
+
+      // Check pause
+      while (this.pausedTransfers.has(transferId)) {
+        await new Promise(r => { this._resumeResolvers.set(transferId, r); });
+      }
+
       const beforeThisRound = sentIndex;
       const pathFinder = algo === 'bfs' ? bfsPath : algo === 'dfs' ? dfsPath : dijkstraPath;
       const path = pathFinder(this.graph, selfId, receiverId, this.log);
       if (!path) {
-        if (algo === 'dijkstra' && routeWaitAttempts++ < 40) {
-          this.log('Waiting for measured link latency before routing…', 'warn');
+        if (routeWaitAttempts++ < 50) {
+          this.log('Waiting for the mesh to heal before routing…', 'warn');
           await sleep(250);
           continue;
         }
@@ -668,6 +877,9 @@ export class TransferManager {
         return;
       }
       routeWaitAttempts = 0;
+
+      const senderRec = this.activeSenders.get(transferId);
+      if (senderRec) senderRec.currentPath = path;
 
       const nextHop = path[1];
       const dc = this.dataChannels.get(nextHop);
@@ -679,12 +891,12 @@ export class TransferManager {
       }
       stallGuard = 0;
 
-      const batchChunks = totalChunks - sentIndex;
+      const batchChunks = Math.min(MAX_BATCH_CHUNKS, totalChunks - sentIndex);
       const meta = {
         type: 'file-meta', transferId, path, totalChunks, startIndex: sentIndex,
         batchChunks, fileName: file.name, fileSize: buffer.byteLength,
         mimeType: file.type || 'application/octet-stream', continuation,
-        sha256: fileHash, // ── Step 11: include hash in meta ──
+        sha256: fileHash,
       };
       try {
         await waitForBufferedAmountBelow(dc, MAX_BUFFERED_AMOUNT, this.log);
@@ -697,18 +909,29 @@ export class TransferManager {
       this.ui.onPathUsed(path);
       this.log(`Sending via ${path.join(' → ')} (chunks ${sentIndex}-${totalChunks - 1})`, 'hi');
 
-      // ── Steps 1–2: Send framed chunks with fileId + chunkIndex ──
       let brokenMidBatch = false;
       const batchStart = sentIndex;
       for (let i = 0; i < batchChunks; i++) {
+        // Pause check
+        while (this.pausedTransfers.has(transferId)) {
+          await new Promise(r => { this._resumeResolvers.set(transferId, r); });
+        }
+
         const idx = batchStart + i;
+        const failure = this.failedRoutes.get(transferId);
+        if (failure) {
+          this.failedRoutes.delete(transferId);
+          sentIndex = Math.min(sentIndex, failure.chunkIndex);
+          this.log(`Relay route failed at chunk ${failure.chunkIndex}; selecting a new path.`, 'warn');
+          brokenMidBatch = true;
+          break;
+        }
         const framed = framedChunks[idx];
         if (!(framed instanceof ArrayBuffer)) {
           this.log(`Internal error: framed chunk ${idx}/${totalChunks} is not ArrayBuffer — aborting`, 'err');
           return;
         }
 
-        // ── Step 6: Check for disconnection on every chunk ──
         const curDc = this.dataChannels.get(nextHop);
         if (!curDc || curDc.readyState !== 'open') {
           this.log(`Hop to ${nextHop} dropped mid-transfer — rerouting from chunk ${idx}`, 'warn');
@@ -717,7 +940,7 @@ export class TransferManager {
         }
         try {
           await waitForBufferedAmountBelow(curDc, MAX_BUFFERED_AMOUNT, this.log);
-          curDc.send(framed); // ── send framed (fileId+chunkIndex+payload) ──
+          curDc.send(framed);
         } catch (e) {
           this.log(`Send failed at chunk ${idx}: ${e.message} — rerouting`, 'err');
           brokenMidBatch = true;
@@ -742,35 +965,42 @@ export class TransferManager {
 
     this.log(`All ${totalChunks} chunks handed off — starting NACK/retransmit phase.`, 'ok');
 
-    // ── Steps 8–9: Exchange missing-chunk info + retransmit only missing chunks ──
-    await this._retransmitMissing(transferId, framedChunks, selfId, receiverId, algo, totalChunks);
+    // NACK retransmit phase
+    const receiverConfirmed = await this._retransmitMissing(
+      transferId, framedChunks, selfId, receiverId, algo, totalChunks,
+    );
+
+    this.activeSenders.delete(transferId);
+    if (!receiverConfirmed) {
+      await this.storage.updateTransferStatus(transferId, 'failed');
+      this.log('Transfer incomplete — receiver never confirmed every chunk.', 'err');
+      this.ui.onSendFailed?.(transferId);
+      this._ackResolvers.delete(transferId);
+      return;
+    }
+
+    await this.storage.updateTransferStatus(transferId, 'completed');
 
     this.log(`Transfer complete.`, 'ok');
     this.ui.onSendComplete(transferId);
     this._ackResolvers.delete(transferId);
   }
 
-  /**
-   * ── Steps 8–9: Retransmit missing chunks ──
-   *
-   * 1. Wait a moment for in-flight chunks to arrive.
-   * 2. Send `request-nack` to the receiver along the current best route.
-   * 3. Wait for `nack-report` with the list of missing indices.
-   * 4. Retransmit only those chunks.
-   * 5. Repeat up to MAX_RETRANSMIT_ROUNDS.
-   */
   async _retransmitMissing(transferId, framedChunks, selfId, receiverId, algo, totalChunks) {
     const resolvers = this._ackResolvers.get(transferId);
-    if (!resolvers) return;
+    if (!resolvers) return false;
 
     for (let round = 0; round < MAX_RETRANSMIT_ROUNDS; round++) {
-      // Small grace period for in-flight chunks to land
+      // Pause check
+      while (this.pausedTransfers.has(transferId)) {
+        await new Promise(r => { this._resumeResolvers.set(transferId, r); });
+      }
+
       await sleep(NACK_WAIT_MS);
 
-      // Find route to receiver
       const pathFinder = algo === 'bfs' ? bfsPath : algo === 'dfs' ? dfsPath : dijkstraPath;
       const path = pathFinder(this.graph, selfId, receiverId, this.log);
-      if (!path) { this.log('No route to receiver for NACK round — stopping retransmit.', 'warn'); return; }
+      if (!path) { this.log('No route to receiver for NACK round — stopping retransmit.', 'warn'); continue; }
       const nextHop = path[1];
       const dc = this.dataChannels.get(nextHop);
       if (!dc || dc.readyState !== 'open') {
@@ -778,9 +1008,8 @@ export class TransferManager {
         continue;
       }
 
-      // Ask receiver what's missing
       const nackPromise = new Promise(resolve => { resolvers.resolveNack = resolve; });
-      dc.send(JSON.stringify({ type: 'request-nack', transferId }));
+      dc.send(JSON.stringify({ type: 'request-nack', transferId, path }));
       this.log(`NACK round ${round + 1}: waiting for missing-chunk report…`, 'hi');
 
       let report;
@@ -800,12 +1029,11 @@ export class TransferManager {
 
       if (report.missing.length === 0) {
         this.log(`NACK round ${round + 1}: receiver has all ${totalChunks} chunks ✓`, 'ok');
-        return; // Done!
+        return true;
       }
 
       this.log(`NACK round ${round + 1}: retransmitting ${report.missing.length} missing chunk(s)`, 'warn');
 
-      // Send a retransmit-meta so the receiver knows chunks are coming
       const retransmitMeta = {
         type: 'retransmit-meta',
         transferId, path,
@@ -813,7 +1041,6 @@ export class TransferManager {
         batchChunks: report.missing.length,
         startIndex: report.missing[0],
         continuation: true,
-        // Note: receiver won't re-init state on retransmit-meta (continuation=true)
       };
       try {
         await waitForBufferedAmountBelow(dc, MAX_BUFFERED_AMOUNT, this.log);
@@ -823,8 +1050,12 @@ export class TransferManager {
         continue;
       }
 
-      // ── Step 9: Retransmit only missing chunks ──
       for (const idx of report.missing) {
+        // Pause check
+        while (this.pausedTransfers.has(transferId)) {
+          await new Promise(r => { this._resumeResolvers.set(transferId, r); });
+        }
+
         const framed = framedChunks[idx];
         const curDc = this.dataChannels.get(nextHop);
         if (!curDc || curDc.readyState !== 'open') {
@@ -844,5 +1075,6 @@ export class TransferManager {
     }
 
     this.log(`Retransmit rounds exhausted (${MAX_RETRANSMIT_ROUNDS}). Receiver may have missing chunks.`, 'warn');
+    return false;
   }
 }

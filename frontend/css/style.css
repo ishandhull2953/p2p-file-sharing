@@ -360,3 +360,39 @@ table.routing-table .status-dot.off{ background: var(--ink-faint); }
 .hash-verify-badge.fail { background: var(--danger-soft); color: #9F1239; border: 1px solid #FDA4AF; }
 .hash-verify-badge.fail svg { stroke: #E11D48; }
 
+/* ---------- Transfer Controls & IndexedDB ---------- */
+.transfer-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin-bottom: 12px;
+}
+.transfer-controls .btn {
+  width: auto;
+  padding: 6px 12px;
+  font-size: 11.5px;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+}
+.transfer-controls .btn svg {
+  flex-shrink: 0;
+}
+.storage-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--ink-soft);
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 500;
+}
+.storage-badge svg {
+  color: var(--accent);
+}
+
+

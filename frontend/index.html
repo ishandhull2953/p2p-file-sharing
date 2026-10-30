@@ -104,6 +104,17 @@
 
     <div class="tab-panel active" data-tab-panel="chunks">
       <div class="transfer-meta" id="transferMeta">No transfer yet.</div>
+      <div class="transfer-controls" id="transferControls" style="display:none;">
+        <button class="btn subtle" id="btnPauseResume">
+          <svg id="pauseIcon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+          <svg id="resumeIcon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          <span id="btnPauseResumeLabel">Pause transfer</span>
+        </button>
+        <div class="storage-badge" id="storageBadge">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7v10c0 2.2 3.6 4 8 4s8-1.8 8-4V7M4 7c0 2.2 3.6 4 8 4s8-1.8 8-4M4 7c0-2.2 3.6-4 8-4s8 1.8 8 4M4 12c0 2.2 3.6 4 8 4s8-1.8 8-4"/></svg>
+          <span id="storageBadgeText">IndexedDB active</span>
+        </div>
+      </div>
       <div class="progress-track" id="progressTrack" style="display:none;"><div class="progress-fill" id="progressFill"></div></div>
       <div class="chunk-grid" id="chunkGrid"></div>
       <div id="downloadWrap"><a id="downloadLink" download>Download reassembled file</a></div>

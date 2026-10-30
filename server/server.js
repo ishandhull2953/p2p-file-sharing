@@ -33,7 +33,10 @@ function getLanAddresses() {
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  pingInterval: 3000, // check peer health every 3 seconds
+  pingTimeout: 3000,   // prune dead peers after 3 seconds of missed pong
+});
 
 const PORT = process.env.PORT || 3000;
 
@@ -123,6 +126,87 @@ function broadcastTopology(event) {
   io.emit('topology-update', { topology: serializeTopology(), event });
 }
 
+function getPeerDegree(id) {
+  let count = 0;
+  for (const e of edges.values()) {
+    if (e.a === id || e.b === id) count++;
+  }
+  return count;
+}
+
+function healMesh() {
+  const onlinePeers = [...nodes.keys()].filter(id => nodes.get(id).online);
+  if (onlinePeers.length < 2) return;
+
+  // Build Disjoint Set Union (DSU) to check graph connectivity
+  const parent = new Map(onlinePeers.map(id => [id, id]));
+  function find(x) {
+    if (parent.get(x) !== x) parent.set(x, find(parent.get(x)));
+    return parent.get(x);
+  }
+  function union(a, b) {
+    const ra = find(a), rb = find(b);
+    if (ra !== rb) parent.set(ra, rb);
+  }
+
+  for (const e of edges.values()) {
+    if (parent.has(e.a) && parent.has(e.b)) union(e.a, e.b);
+  }
+
+  // Group peers by connected component
+  const components = new Map();
+  for (const id of onlinePeers) {
+    const root = find(id);
+    if (!components.has(root)) components.set(root, []);
+    components.get(root).push(id);
+  }
+
+  let healed = false;
+  const compList = [...components.values()];
+
+  // If there are multiple disconnected partitions, bridge them!
+  for (let i = 0; i < compList.length - 1; i++) {
+    const groupA = compList[i];
+    const groupB = compList[i + 1];
+    groupA.sort((x, y) => getPeerDegree(x) - getPeerDegree(y));
+    groupB.sort((x, y) => getPeerDegree(x) - getPeerDegree(y));
+    const pA = groupA[0];
+    const pB = groupB[0];
+    if (pA && pB && !edges.has(edgeKey(pA, pB))) {
+      addEdge(pA, pB, null);
+      healed = true;
+      console.log(`[Mesh Healing] Bridged partition: ${pA} <--> ${pB}`);
+      const socketA = socketByPeer.get(pA);
+      if (socketA) {
+        io.to(socketA).emit('mesh-connect', { targetPeerId: pB, isOfferer: true });
+      }
+    }
+  }
+
+  // Ensure every node has at least 2 connections (or N-1 if N <= 2)
+  const targetDegree = Math.min(2, onlinePeers.length - 1);
+  for (const id of onlinePeers) {
+    if (getPeerDegree(id) < targetDegree) {
+      const candidates = onlinePeers.filter(other => other !== id && !edges.has(edgeKey(id, other)));
+      if (candidates.length > 0) {
+        candidates.sort((x, y) => getPeerDegree(x) - getPeerDegree(y));
+        const partner = candidates[0];
+        addEdge(id, partner, null);
+        healed = true;
+        console.log(`[Mesh Healing] Re-linking under-connected peer ${id} <--> ${partner}`);
+        const socketId = socketByPeer.get(id);
+        if (socketId) {
+          io.to(socketId).emit('mesh-connect', { targetPeerId: partner, isOfferer: true });
+        }
+      }
+    }
+  }
+
+  if (healed) {
+    broadcastTopology('Mesh self-healed');
+  }
+}
+
 /* ---------------------------------------------------------------------
  * Socket.IO handlers
  * ------------------------------------------------------------------- */
@@ -132,14 +216,18 @@ io.on('connection', async (socket) => {
   socketByPeer.set(peerId, socket.id);
   peerBySocket.set(socket.id, peerId);
 
-  // Pick 1-2 existing online peers to link this new peer to (mesh join)
+  // Degree-balanced mesh joining:
+  // Sort existing online peers by degree ascending (fewest connections first)
   const existing = [...nodes.keys()].filter(id => id !== peerId && nodes.get(id).online);
-  const linkCount = Math.min(existing.length, 1 + Math.floor(Math.random() * 2));
-  const shuffled = [...existing].sort(() => Math.random() - 0.5).slice(0, linkCount);
+  existing.sort((a, b) => getPeerDegree(a) - getPeerDegree(b));
+
+  // Determine healthy connection count:
+  // 1 peer -> 1 link; 2 peers -> 2 links (triangle); 3+ peers -> 2 to 3 links
+  const desiredLinks = Math.min(existing.length, existing.length <= 2 ? existing.length : Math.min(3, 2 + (existing.length % 2)));
+  const chosenNeighbors = existing.slice(0, desiredLinks);
   const neighborsToConnect = [];
-  shuffled.forEach(n => {
-    // Do not invent a cost. The browser reports the measured network latency
-    // once this proposed WebRTC link is actually open.
+
+  chosenNeighbors.forEach(n => {
     addEdge(peerId, n, null);
     neighborsToConnect.push(n);
   });
@@ -178,7 +266,6 @@ io.on('connection', async (socket) => {
     const roundedLatency = Math.round(latency);
     if (edge.weight === roundedLatency) return;
     edge.weight = roundedLatency;
-    // Share the fresh weight without flooding every peer's activity log.
     broadcastTopology();
   });
 
@@ -200,6 +287,9 @@ io.on('connection', async (socket) => {
     peerBySocket.delete(socket.id);
     console.log(`[-] ${peerId} disconnected`);
     broadcastTopology(`${peerId} left`);
+
+    // Automatically heal the mesh after a peer disconnects
+    healMesh();
   });
 });
 
